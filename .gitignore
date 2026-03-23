@@ -1,5 +1,6 @@
 
 !jobs/*.md
+.DS_Store
 /.cache/
 /.idea/
 /jobs/*.memory.md
