@@ -1,4 +1,6 @@
-# tropicron
+# pforret/tropicron.sh
+
+![](assets/unsplash.clock.jpg)
 
 A self-modifiable agent scheduling system for Claude Code.
 
