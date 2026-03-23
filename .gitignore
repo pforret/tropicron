@@ -1,11 +1,7 @@
-# Runtime state
-logs/
-locks/
-jobs/*.memory.md
 
-# Keep job definitions and examples tracked
 !jobs/*.md
-!examples/*.md
-
-# Cache directories
-.cache/
+/.cache/
+/.idea/
+/jobs/*.memory.md
+/locks/
+/logs/
