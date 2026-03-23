@@ -4,6 +4,12 @@ A self-modifiable agent scheduling system for Claude Code.
 
 tropicron is a file-based cron scheduler that runs Claude Code sessions on a schedule. It's called every minute by the OS crontab, matches cron expressions in job definition files, and launches Claude (or shell commands) accordingly.
 
+## Why tropicron
+
+**Zero tokens when idle** — All scheduling logic runs in pure bash. Cron matching, precheck diffing, and singleton detection happen without invoking the LLM. Claude is only called when a job actually fires *and* has something to do. A precheck that finds no changes costs zero tokens.
+
+**Jobs are just Markdown files** — Each job is a readable `.md` file with YAML frontmatter for scheduling and a prompt body. You can add, edit, or delete jobs with any text editor, `git`, or the `/tropicron` Claude Code skill. An LLM can manage its own job schedule by writing `.md` files — no API, no database, no config format to learn.
+
 ## Quick start
 
 ```bash
