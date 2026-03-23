@@ -1,0 +1,12 @@
+{
+  "name": "Tropicron",
+  "description": "Scheduled job management for Claude Code",
+  "url": "https://raw.githubusercontent.com/pforret/tropicron/main",
+  "plugins": [
+    {
+      "name": "tropicron",
+      "description": "File-based cron scheduler — manage scheduled Claude Code jobs with Markdown files",
+      "source": "."
+    }
+  ]
+}

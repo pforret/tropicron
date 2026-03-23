@@ -1,4 +1,4 @@
-# pforret/tropicron.sh
+# pforret/tropicron
 
 ![](assets/unsplash.tropical.jpg)
 

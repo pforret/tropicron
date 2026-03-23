@@ -1,0 +1,8 @@
+{
+  "name": "tropicron",
+  "description": "File-based cron scheduler for Claude Code — manage scheduled AI jobs with Markdown files",
+  "version": "0.0.1",
+  "author": {
+    "name": "pforret"
+  }
+}
