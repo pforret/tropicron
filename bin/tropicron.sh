@@ -217,10 +217,8 @@ function get_matching_jobs() {
     [[ "$(basename "$job_file")" == *.memory.md ]] && continue
     has_jobs=1
 
-    local cron_expr enabled
+    local cron_expr
     cron_expr=$(awk '/^---$/{n++; next} n==1 && /^cron:/{gsub(/^cron: *"?|"? *$/,"",$0); print; exit}' "$job_file")
-    enabled=$(awk '/^---$/{n++; next} n==1 && /^enabled:/{gsub(/^enabled: *|^ */,"",$0); print; exit}' "$job_file")
-    [[ "${enabled:-true}" == "false" ]] && continue
     [[ -z "$cron_expr" ]] && continue
     job_lines+="$(basename "$job_file" .md)|${cron_expr}"$'\n'
   done
@@ -277,6 +275,22 @@ function get_matching_jobs() {
       print job
     }
   }'
+}
+
+### --- Skip auditing ---
+
+function log_skip() {
+  local job_name="$1"
+  local reason="$2"
+  local detail="${3:-}"
+  IO:log "Skipped $job_name: $reason${detail:+ ($detail)}"
+  local job_log_dir="${LOG_DIR}/jobs/${job_name}"
+  [[ ! -d "$job_log_dir" ]] && mkdir -p "$job_log_dir"
+  printf '%s | %s%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$reason" \
+    "${detail:+ | $detail}" \
+    >>"${job_log_dir}/skipped.log"
 }
 
 ### --- Lock file mechanism ---
@@ -472,8 +486,15 @@ function do_run() {
     # Full frontmatter parse for this job
     parse_frontmatter "$job_file"
 
+    # Enabled check (cron matched, but job is disabled)
+    if [[ "${JOB_ENABLED:-true}" == "false" ]]; then
+      log_skip "$job_name" "disabled"
+      continue
+    fi
+
     # Singleton check
     if ! acquire_lock "$job_name" "$JOB_SINGLETON"; then
+      log_skip "$job_name" "singleton" "previous run still active"
       continue
     fi
 
@@ -484,7 +505,7 @@ function do_run() {
       precheck_output=$(cd "${JOB_WORKDIR:-$script_install_folder}" && eval "$JOB_PRECHECK" 2>&1) || true
       precheck_exit=$?
       if [[ $precheck_exit -eq 0 ]] && [[ -z "$precheck_output" ]]; then
-        IO:debug "Precheck passed clean for $job_name — skipping LLM call"
+        log_skip "$job_name" "precheck-clean"
         release_lock "$job_name"
         continue
       fi
@@ -639,24 +660,52 @@ function do_history() {
     fi
     IO:print "## History: $job_name"
     IO:print ""
-    printf "%-20s %-10s %s\n" "Timestamp" "Result" "Duration"
-    printf "%-20s %-10s %s\n" "---------" "------" "--------"
-    for log_file in $(ls -t "$job_log_dir"/*.log 2>/dev/null | head -20); do
-      local timestamp result_line
-      timestamp=$(basename "$log_file" .log | tr '_' ' ')
-      result_line=$(tail -1 "$log_file")
-      local status="unknown" duration=""
-      if [[ "$result_line" == ---EXIT:* ]]; then
-        if [[ "$result_line" == *"EXIT:0"* ]]; then
-          status="OK"
-        elif [[ "$result_line" == *"TIMEOUT"* ]]; then
-          status="TIMEOUT"
-        else
-          status="FAIL"
+    printf "%-20s %-12s %s\n" "Timestamp" "Result" "Detail"
+    printf "%-20s %-12s %s\n" "---------" "------" "------"
+    local merged
+    merged=$(
+      for log_file in "$job_log_dir"/*.log; do
+        [[ ! -f "$log_file" ]] && continue
+        [[ "$(basename "$log_file")" == "skipped.log" ]] && continue
+        local raw timestamp result_line status duration hhmm
+        raw=$(basename "$log_file" .log)
+        hhmm="${raw##*_}"
+        timestamp="${raw%_*} ${hhmm:0:2}:${hhmm:2:2}"
+        result_line=$(tail -1 "$log_file")
+        status="unknown"
+        duration=""
+        if [[ "$result_line" == ---EXIT:* ]]; then
+          if [[ "$result_line" == *"EXIT:0"* ]]; then
+            status="OK"
+          elif [[ "$result_line" == *"TIMEOUT"* ]]; then
+            status="TIMEOUT"
+          else
+            status="FAIL"
+          fi
+          duration=$(echo "$result_line" | grep -o 'DURATION:[^ ]*' | cut -d: -f2)
         fi
-        duration=$(echo "$result_line" | grep -o 'DURATION:[^ ]*' | cut -d: -f2)
+        printf '%s\t%s\t%s\n' "$timestamp" "$status" "${duration:-—}"
+      done
+      if [[ -f "$job_log_dir/skipped.log" ]]; then
+        while IFS= read -r line; do
+          local sk_ts sk_reason sk_detail rest
+          sk_ts="${line%% | *}"
+          sk_ts="${sk_ts:0:16}"
+          rest="${line#* | }"
+          if [[ "$rest" == *" | "* ]]; then
+            sk_reason="${rest%% | *}"
+            sk_detail="${rest#* | }"
+          else
+            sk_reason="$rest"
+            sk_detail=""
+          fi
+          printf '%s\tSKIP:%s\t%s\n' "$sk_ts" "$sk_reason" "${sk_detail:-—}"
+        done <"$job_log_dir/skipped.log"
       fi
-      printf "%-20s %-10s %s\n" "$timestamp" "$status" "${duration:-—}"
+    )
+    echo "$merged" | sort -r | head -20 | while IFS=$'\t' read -r ts result detail; do
+      [[ -z "$ts" ]] && continue
+      printf "%-20s %-12s %s\n" "$ts" "$result" "$detail"
     done
   else
     # Show history for all jobs
