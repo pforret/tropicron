@@ -138,12 +138,17 @@ bin/url-changed.sh "https://docs.example.com/changelog"
 
 ## Logging
 
-All job execution is logged to `logs/jobs/<job-name>/YYYY-MM-DD_HHMM.log`. The last line of each log contains exit status and duration:
+All job activity is appended to a single per-day file `logs/jobs/<job-name>/YYYY-MM-DD.log`. Each event is a tagged line; raw output of the job is written verbatim between `START` and `EXIT`:
 
 ```
----EXIT:0 DURATION:42s---
----EXIT:TIMEOUT DURATION:300s---
----EXIT:1 DURATION:5s---
+09:00:01 | START | llm timeout=300s
+<claude stdout/stderr>
+09:00:42 | EXIT  | 0 duration=42s
+10:00:01 | SKIP  | precheck-clean
+11:00:01 | SKIP  | singleton | previous run still active
+12:00:01 | START | shell
+<command stdout/stderr>
+12:00:05 | EXIT  | 1 duration=5s
 ```
 
 Logs older than 30 days are automatically cleaned up. The main scheduler log is at `$LOG_DIR/tropicron.<date>.log`.

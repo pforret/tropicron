@@ -60,7 +60,7 @@ Markdown with YAML frontmatter. Key fields: `cron` (required), `enabled`, `timeo
 
 ## Runtime directories (gitignored)
 
-- `logs/jobs/<name>/` — per-job execution logs (`YYYY-MM-DD_HHMM.log`)
+- `logs/jobs/<name>/` — per-job daily log (`YYYY-MM-DD.log`); tagged lines `HH:MM:SS | START|EXIT|SKIP | …` interleaved with raw job output
 - `locks/` — PID-based lock files for singleton jobs
 - `jobs/*.memory.md` — per-job persistent memory
 - `~/.cache/tropicron/` — precheck caches (cli-changed, url-changed)

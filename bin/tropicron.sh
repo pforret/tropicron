@@ -277,20 +277,32 @@ function get_matching_jobs() {
   }'
 }
 
-### --- Skip auditing ---
+### --- Per-job daily log ---
+###
+### Each job has one log file per day: ${LOG_DIR}/jobs/<name>/YYYY-MM-DD.log
+### Lines are tagged so do_history can parse them:
+###   HH:MM:SS | START | <kind> timeout=Ns
+###   HH:MM:SS | EXIT  | <code|TIMEOUT> duration=Ns
+###   HH:MM:SS | SKIP  | <reason>[ | <detail>]
+### Anything else is verbatim job output (claude or shell stdout/stderr).
+
+function job_log_path() {
+  local job_name="$1"
+  local job_log_dir="${LOG_DIR}/jobs/${job_name}"
+  [[ ! -d "$job_log_dir" ]] && mkdir -p "$job_log_dir"
+  echo "${job_log_dir}/$(date +%Y-%m-%d).log"
+}
 
 function log_skip() {
   local job_name="$1"
   local reason="$2"
   local detail="${3:-}"
   IO:log "Skipped $job_name: $reason${detail:+ ($detail)}"
-  local job_log_dir="${LOG_DIR}/jobs/${job_name}"
-  [[ ! -d "$job_log_dir" ]] && mkdir -p "$job_log_dir"
-  printf '%s | %s%s\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S')" \
+  printf '%s | SKIP  | %s%s\n' \
+    "$(date '+%H:%M:%S')" \
     "$reason" \
     "${detail:+ | $detail}" \
-    >>"${job_log_dir}/skipped.log"
+    >>"$(job_log_path "$job_name")"
 }
 
 ### --- Lock file mechanism ---
@@ -350,16 +362,19 @@ function execute_job() {
 
   # If run: is set, execute shell command directly (no LLM)
   if [[ -n "$JOB_RUN" ]]; then
-    local job_log_dir="${LOG_DIR}/jobs/${job_name}"
-    [[ ! -d "$job_log_dir" ]] && mkdir -p "$job_log_dir"
-    local log_file="${job_log_dir}/$(date +%Y-%m-%d_%H%M).log"
+    local log_file
+    log_file=$(job_log_path "$job_name")
     local workdir="${JOB_WORKDIR:-$script_install_folder}"
     IO:log "Executing shell job: $job_name"
+    echo "$(date '+%H:%M:%S') | START | shell" >>"$log_file"
     (
       cd "$workdir" || exit 1
-      eval "$JOB_RUN" >"$log_file" 2>&1
+      local start_time
+      start_time=$(date +%s)
+      eval "$JOB_RUN" >>"$log_file" 2>&1
       local exit_code=$?
-      echo "---EXIT:${exit_code}---" >>"$log_file"
+      local duration=$(( $(date +%s) - start_time ))
+      echo "$(date '+%H:%M:%S') | EXIT  | ${exit_code} duration=${duration}s" >>"$log_file"
       release_lock "$job_name"
     ) &
     return
@@ -400,7 +415,8 @@ function execute_job() {
   [[ ! -d "$job_log_dir" ]] && mkdir -p "$job_log_dir"
   # Cleanup old logs (older than 30 days)
   find "$job_log_dir" -name "*.log" -mtime +30 -delete 2>/dev/null || true
-  local log_file="${job_log_dir}/$(date +%Y-%m-%d_%H%M).log"
+  local log_file
+  log_file=$(job_log_path "$job_name")
 
   # Build claude invocation args
   local claude_args=()
@@ -425,30 +441,31 @@ function execute_job() {
   local workdir="${JOB_WORKDIR:-$script_install_folder}"
 
   IO:log "Executing job: $job_name (timeout=${JOB_TIMEOUT}s)"
+  echo "$(date '+%H:%M:%S') | START | llm timeout=${JOB_TIMEOUT}s" >>"$log_file"
 
   # Run in background subshell
   (
     cd "$workdir" || exit 1
     local start_time
     start_time=$(date +%s)
-    timeout "$JOB_TIMEOUT" claude "${claude_args[@]}" >"$log_file" 2>&1
+    timeout "$JOB_TIMEOUT" claude "${claude_args[@]}" >>"$log_file" 2>&1
     local exit_code=$?
     local duration=$(( $(date +%s) - start_time ))
 
     if [[ $exit_code -eq 0 ]]; then
-      echo "---EXIT:0 DURATION:${duration}s---" >>"$log_file"
+      echo "$(date '+%H:%M:%S') | EXIT  | 0 duration=${duration}s" >>"$log_file"
       IO:log "Job $job_name completed successfully (${duration}s)"
       if [[ -n "$JOB_NOTIFY_ON_SUCCESS" ]]; then
         JOB_NAME="$job_name" eval "$JOB_NOTIFY_ON_SUCCESS" 2>/dev/null || true
       fi
     elif [[ $exit_code -eq 124 ]]; then
-      echo "---EXIT:TIMEOUT DURATION:${duration}s---" >>"$log_file"
+      echo "$(date '+%H:%M:%S') | EXIT  | TIMEOUT duration=${duration}s" >>"$log_file"
       IO:log "Job $job_name timed out after ${JOB_TIMEOUT}s"
       if [[ -n "$JOB_NOTIFY_ON_FAILURE" ]]; then
         JOB_NAME="$job_name" JOB_ERROR="timeout" eval "$JOB_NOTIFY_ON_FAILURE" 2>/dev/null || true
       fi
     else
-      echo "---EXIT:${exit_code} DURATION:${duration}s---" >>"$log_file"
+      echo "$(date '+%H:%M:%S') | EXIT  | ${exit_code} duration=${duration}s" >>"$log_file"
       IO:log "Job $job_name failed with exit code $exit_code (${duration}s)"
       if [[ -n "$JOB_NOTIFY_ON_FAILURE" ]]; then
         JOB_NAME="$job_name" JOB_ERROR="exit_${exit_code}" eval "$JOB_NOTIFY_ON_FAILURE" 2>/dev/null || true
@@ -539,14 +556,17 @@ function do_list() {
     local job_name
     job_name=$(basename "$job_file" .md)
 
-    # Find last run from logs
+    # Find last run/skip from logs
     local last_run="—"
     local job_log_dir="${LOG_DIR}/jobs/${job_name}"
     if [[ -d "$job_log_dir" ]]; then
-      local latest_log
+      local latest_log latest_event
       latest_log=$(ls -t "$job_log_dir"/*.log 2>/dev/null | head -1)
       if [[ -n "$latest_log" ]]; then
-        last_run=$(basename "$latest_log" .log | tr '_' ' ')
+        latest_event=$(grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2} \| (START|EXIT|SKIP)' "$latest_log" | tail -1)
+        if [[ -n "$latest_event" ]]; then
+          last_run="$(basename "$latest_log" .log) ${latest_event:0:5}"
+        fi
       fi
     fi
 
@@ -652,7 +672,6 @@ function do_history() {
   local log_base="${LOG_DIR}/jobs"
 
   if [[ -n "$job_name" ]]; then
-    # Show history for specific job
     local job_log_dir="${log_base}/${job_name}"
     if [[ ! -d "$job_log_dir" ]]; then
       IO:print "No history for job: $job_name"
@@ -662,84 +681,73 @@ function do_history() {
     IO:print ""
     printf "%-20s %-12s %s\n" "Timestamp" "Result" "Detail"
     printf "%-20s %-12s %s\n" "---------" "------" "------"
-    local merged
-    merged=$(
-      for log_file in "$job_log_dir"/*.log; do
-        [[ ! -f "$log_file" ]] && continue
-        [[ "$(basename "$log_file")" == "skipped.log" ]] && continue
-        local raw timestamp result_line status duration hhmm
-        raw=$(basename "$log_file" .log)
-        hhmm="${raw##*_}"
-        timestamp="${raw%_*} ${hhmm:0:2}:${hhmm:2:2}"
-        result_line=$(tail -1 "$log_file")
-        status="unknown"
-        duration=""
-        if [[ "$result_line" == ---EXIT:* ]]; then
-          if [[ "$result_line" == *"EXIT:0"* ]]; then
-            status="OK"
-          elif [[ "$result_line" == *"TIMEOUT"* ]]; then
-            status="TIMEOUT"
-          else
-            status="FAIL"
-          fi
-          duration=$(echo "$result_line" | grep -o 'DURATION:[^ ]*' | cut -d: -f2)
-        fi
-        printf '%s\t%s\t%s\n' "$timestamp" "$status" "${duration:-—}"
-      done
-      if [[ -f "$job_log_dir/skipped.log" ]]; then
-        while IFS= read -r line; do
-          local sk_ts sk_reason sk_detail rest
-          sk_ts="${line%% | *}"
-          sk_ts="${sk_ts:0:16}"
-          rest="${line#* | }"
-          if [[ "$rest" == *" | "* ]]; then
-            sk_reason="${rest%% | *}"
-            sk_detail="${rest#* | }"
-          else
-            sk_reason="$rest"
-            sk_detail=""
-          fi
-          printf '%s\tSKIP:%s\t%s\n' "$sk_ts" "$sk_reason" "${sk_detail:-—}"
-        done <"$job_log_dir/skipped.log"
-      fi
-    )
-    echo "$merged" | sort -r | head -20 | while IFS=$'\t' read -r ts result detail; do
-      [[ -z "$ts" ]] && continue
-      printf "%-20s %-12s %s\n" "$ts" "$result" "$detail"
-    done
+    parse_event_lines "$job_log_dir" \
+      | sort -r | head -20 \
+      | while IFS=$'\t' read -r ts result detail; do
+          [[ -z "$ts" ]] && continue
+          printf "%-20s %-12s %s\n" "$ts" "$result" "$detail"
+        done
   else
-    # Show history for all jobs
     if [[ ! -d "$log_base" ]]; then
       IO:print "No execution history found"
       return 0
     fi
-    IO:print "## Recent executions (last 20)"
+    IO:print "## Recent events (last 20)"
     IO:print ""
-    printf "%-16s %-20s %-10s %s\n" "Job" "Timestamp" "Result" "Duration"
-    printf "%-16s %-20s %-10s %s\n" "---" "---------" "------" "--------"
-    # Find all log files, sort by time, show last 20
-    find "$log_base" -name "*.log" -type f -print0 2>/dev/null |
-      xargs -0 ls -t 2>/dev/null |
-      head -20 |
-      while IFS= read -r log_file; do
-        local jname timestamp result_line
-        jname=$(basename "$(dirname "$log_file")")
-        timestamp=$(basename "$log_file" .log | tr '_' ' ')
-        result_line=$(tail -1 "$log_file")
-        local status="unknown" duration=""
-        if [[ "$result_line" == ---EXIT:* ]]; then
-          if [[ "$result_line" == *"EXIT:0"* ]]; then
-            status="OK"
-          elif [[ "$result_line" == *"TIMEOUT"* ]]; then
-            status="TIMEOUT"
-          else
-            status="FAIL"
-          fi
-          duration=$(echo "$result_line" | grep -o 'DURATION:[^ ]*' | cut -d: -f2)
-        fi
-        printf "%-16s %-20s %-10s %s\n" "$jname" "$timestamp" "$status" "${duration:-—}"
+    printf "%-16s %-20s %-12s %s\n" "Job" "Timestamp" "Result" "Detail"
+    printf "%-16s %-20s %-12s %s\n" "---" "---------" "------" "------"
+    {
+      for jdir in "$log_base"/*/; do
+        [[ ! -d "$jdir" ]] && continue
+        local jname
+        jname=$(basename "$jdir")
+        parse_event_lines "$jdir" \
+          | while IFS=$'\t' read -r ts result detail; do
+              [[ -z "$ts" ]] && continue
+              printf '%s\t%s\t%s\t%s\n' "$ts" "$jname" "$result" "$detail"
+            done
       done
+    } | sort -r | head -20 | while IFS=$'\t' read -r ts jname result detail; do
+      printf "%-16s %-20s %-12s %s\n" "$jname" "$ts" "$result" "$detail"
+    done
   fi
+}
+
+# Walk per-day log files in a job dir and emit one row per START/EXIT/SKIP event.
+# Output: TAB-separated "YYYY-MM-DD HH:MM<TAB>RESULT<TAB>DETAIL"
+function parse_event_lines() {
+  local job_log_dir="$1"
+  for log_file in "$job_log_dir"/*.log; do
+    [[ ! -f "$log_file" ]] && continue
+    local date_part
+    date_part=$(basename "$log_file" .log)
+    awk -v date="$date_part" '
+      function trim(s) { sub(/^[[:space:]]+/,"",s); sub(/[[:space:]]+$/,"",s); return s }
+      /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9] \| (START|EXIT |SKIP ) \|/ {
+        time = substr($0, 1, 5)
+        kind = trim($3)
+        rest = $0
+        sub(/^[^|]*\|[^|]*\|[[:space:]]*/, "", rest)
+        if (kind == "EXIT") {
+          code = rest
+          sub(/[[:space:]].*/, "", code)
+          dur = ""
+          if (match(rest, /duration=[^ ]+/)) dur = substr(rest, RSTART+9, RLENGTH-9)
+          status = (code == "0") ? "OK" : (code == "TIMEOUT" ? "TIMEOUT" : "FAIL")
+          printf "%s %s\t%s\t%s\n", date, time, status, (dur ? dur : "—")
+        } else if (kind == "SKIP") {
+          reason = rest
+          detail = "—"
+          if (index(rest, " | ")) {
+            split(rest, parts, " \\| ")
+            reason = parts[1]
+            detail = parts[2]
+          }
+          printf "%s %s\tSKIP:%s\t%s\n", date, time, trim(reason), trim(detail)
+        }
+      }
+    ' "$log_file"
+  done
 }
 
 function do_test() {
